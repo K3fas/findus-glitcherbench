@@ -73,6 +73,7 @@ SPI_WRITE_MASK     = 0x7F
 # frequency calculation constants
 MASTER_CLOCK       = 125000000
 FREQ_RESOLUTION    = 0x1000000
+SRAM_SAMPLE_PERIOD_NS = 1_000_000_000 // MASTER_CLOCK
 
 # gain calculation macros
 GAIN_MAX           = 2.0
@@ -414,14 +415,35 @@ class AD910X():
             raise Exception("Offset value not supported.")
         self.spi_write_register(REG_DAC_DOF, offset)
 
-    def update_sram(self, pulse_number_of_points:int):
+    def update_sram(self, pulse_number_of_points:int, pattern_period:int|None = None):
+        if pulse_number_of_points < 1 or pulse_number_of_points > 0x1000:
+            raise Exception("SRAM pulse length must be in range [1, 4096].")
+        if pattern_period is None:
+            pattern_period = pulse_number_of_points
+        if pattern_period < 1 or pattern_period > 0xFFFF:
+            raise Exception("Pattern period must be in range [1, 65535].")
         self.spi_write_register(REG_START_ADDR, 0x0000) # start SRAM addr to read data from
         stop_addr = (((pulse_number_of_points & 0x0FFF) - 1) << 4) & 0xFFF0
         self.spi_write_register(REG_STOP_ADDR, stop_addr)  # stop SRAM addr
+        self.spi_write_register(REG_PAT_PERIOD, pattern_period & 0xFFFF)
         self.spi_write_register(REG_RAM_UPDATE, UPDATE_SETTINGS)
         self.spi_write_register(REG_PAT_STATUS, START_PATTERN)
 
-    def set_pulse_output_oneshot(self):
+    def set_pat_timebase(self, hold:int = 1, pat_period_base:int = 1, start_delay_base:int = 1):
+        """
+        Configure the DAC timebase scalers.
+        """
+        def encode(value:int) -> int:
+            if value < 1 or value > 16:
+                raise Exception("PAT_TIMEBASE fields must be in range [1, 16].")
+            if value == 16:
+                return 0
+            return value
+
+        reg = ((encode(hold) & 0x0F) << 8) | ((encode(pat_period_base) & 0x0F) << 4) | (encode(start_delay_base) & 0x0F)
+        self.spi_write_register(REG_PAT_TIMEBASE, reg)
+
+    def set_pulse_output_oneshot(self, hold:int = 1, pat_period_base:int = 1, start_delay_base:int = 1):
         """
         Configure the DDS to output one defined pulse.
         """
@@ -429,11 +451,11 @@ class AD910X():
         self.spi_write_register(REG_PAT_TYPE, PATTERN_RPT_FINITE) # pattern is emitted a finite amount of times
         self.spi_write_register(REG_DAC_PAT, 0x0001) # repeat pattern once
         self.spi_write_register(REG_WAV_CONFIG, WAV_CFG_PRESTORE_DDS) # output from DDS
-        self.spi_write_register(REG_PAT_TIMEBASE, 0x0111) # HOLD = 1, PAT_PERIOD_BASE = 1, START_DELAY_BASE = 1; TODO: set the time base, TODO: HOLD = 0 for faster sampling?
+        self.set_pat_timebase(hold=hold, pat_period_base=pat_period_base, start_delay_base=start_delay_base)
         #self.spi_write_register(REG_PATTERN_DLY, 0x000E) # TODO: control this by the delay parameter
         #self.spi_write_register(REG_START_DLY, 0x0003) # TODO: OR: control this by the delay parameter
 
-    def set_pulse_output_continous(self):
+    def set_pulse_output_continous(self, hold:int = 1, pat_period_base:int = 1, start_delay_base:int = 1):
         """
         Configure the DDS to output a defined pulse continously.
         """
@@ -441,7 +463,7 @@ class AD910X():
         self.spi_write_register(REG_PAT_TYPE, PATTERN_RPT_CONTINOUS)
         self.spi_write_register(REG_DAC_PAT, 0x0000)
         self.spi_write_register(REG_WAV_CONFIG, WAV_CFG_PRESTORE_DDS) # output from DDS
-        self.spi_write_register(REG_PAT_TIMEBASE, 0x0111)
+        self.set_pat_timebase(hold=hold, pat_period_base=pat_period_base, start_delay_base=start_delay_base)
 
     def set_wave_output(self, wave:int):
         """

@@ -37,6 +37,52 @@ def glitch():
     # tell execution finished (fills the sm's fifo buffer)
     push(block)
 
+@asm_pio(out_init=(PIO.OUT_LOW,), out_shiftdir=PIO.SHIFT_RIGHT)
+def vtarget_toggle_from_low():
+    # block until delay received
+    pull(block)
+    mov(x, osr)
+    # block until target pin state received
+    pull(block)
+
+    # wait for trigger condition
+    wait(1, irq, 1)
+    # keep the timing aligned with the glitch state machine's irq(0) instruction
+    nop()
+
+    # wait delay
+    label("delay_loop")
+    jmp(x_dec, "delay_loop")
+
+    # apply the requested pin state
+    out(pins, 1)
+
+    # tell execution finished (fills the sm's fifo buffer)
+    push(block)
+
+@asm_pio(out_init=(PIO.OUT_HIGH,), out_shiftdir=PIO.SHIFT_RIGHT)
+def vtarget_toggle_from_high():
+    # block until delay received
+    pull(block)
+    mov(x, osr)
+    # block until target pin state received
+    pull(block)
+
+    # wait for trigger condition
+    wait(1, irq, 1)
+    # keep the timing aligned with the glitch state machine's irq(0) instruction
+    nop()
+
+    # wait delay
+    label("delay_loop")
+    jmp(x_dec, "delay_loop")
+
+    # apply the requested pin state
+    out(pins, 1)
+
+    # tell execution finished (fills the sm's fifo buffer)
+    push(block)
+
 @asm_pio(set_init=(PIO.OUT_LOW), sideset_init=(PIO.OUT_LOW), out_shiftdir=PIO.SHIFT_RIGHT)
 def glitch_burst():
     # block until delay received

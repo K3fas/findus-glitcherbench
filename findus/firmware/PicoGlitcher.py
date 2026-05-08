@@ -40,6 +40,7 @@ class PicoGlitcher():
         self.sm0 = PIO(0).state_machine(0)
         self.sm1 = PIO(0).state_machine(1)
         self.sm2 = PIO(0).state_machine(2)
+        self.sm3 = PIO(0).state_machine(3)
         self.cleanup_pio()
         self.frequency = None
         self.trigger_mode = "tio"
@@ -47,6 +48,11 @@ class PicoGlitcher():
         self.baudrate = 115200
         self.number_of_bits = 8
         self.armed = False
+        self.load_switch_action = "none"
+        self.load_switch_timing = "before"
+        self.load_switch_offset_ns = 0
+        self.load_switch_armed = False
+        self.load_switch_target_value = None
 
         # read config
         with open("config.json", "r") as file:
@@ -62,12 +68,14 @@ class PicoGlitcher():
         self.led.low()
         if (self.config["hardware_version"][0] == 2 and self.config["hardware_version"][1] >= 3) or self.config["hardware_version"][0] == 3:
             # VTARGET_EN (active high) for v2.3 and higher
-            self.pin_vtarget_en = Pin(Globals.VTARGET_EN, Pin.OUT, Pin.PULL_DOWN)
+            self.vtarget_pull = Pin.PULL_DOWN
+            self.pin_vtarget_en = Pin(Globals.VTARGET_EN, Pin.OUT, self.vtarget_pull)
             self.vtarget_enable_value = 1
             self.vtarget_disable_value = 0
         elif (self.config["hardware_version"][0] == 2 and self.config["hardware_version"][1] < 3) or self.config["hardware_version"][0] == 1:
             # VTARGET_EN (active low) for 2.2 and lower
-            self.pin_vtarget_en = Pin(Globals.VTARGET_EN, Pin.OUT, Pin.PULL_UP)
+            self.vtarget_pull = Pin.PULL_UP
+            self.pin_vtarget_en = Pin(Globals.VTARGET_EN, Pin.OUT, self.vtarget_pull)
             self.vtarget_enable_value = 0
             self.vtarget_disable_value = 1
         else:
@@ -120,11 +128,17 @@ class PicoGlitcher():
             self.ad910x.init()
             self.pin_ps_trigger = self.ad910x.get_trigger_pin()
             self.pulse_generator = PulseGenerator(vhigh=self.config["ps_offset"], factor=self.config["ps_factor"])
+            self.ps_auto_timebase = True
+            self.ps_requested_hold_cycles = 1
+            self.ps_hold_cycles = 1
+            self.ps_time_resolution_ns = AD910X.SRAM_SAMPLE_PERIOD_NS
+            self.ps_continuous_output_configured = False
 
     def switch_pio(self, pio_base):
         self.sm0 = PIO(pio_base).state_machine(0)
         self.sm1 = PIO(pio_base).state_machine(1)
         self.sm2 = PIO(pio_base).state_machine(2)
+        self.sm3 = PIO(pio_base).state_machine(3)
 
     def waveform_generator(self, frequency:int = AD910X.DEFAULT_FREQUENCY, gain:float = AD910X.DEFAULT_GAIN, waveid:int = AD910X.WAVE_TRIANGLE):
         if self.config["hardware_version"][0] < 2:
@@ -242,13 +256,89 @@ class PicoGlitcher():
         """
         Enable `VTARGET` output. Activates the Pico Glitcher's power supply for the target.
         """
-        self.pin_vtarget_en.value(self.vtarget_enable_value)
+        self.__set_vtarget_manually(self.vtarget_enable_value)
 
     def disable_vtarget(self):
         """
         Disables `VTARGET` output. Disables the Pico Glitcher's power supply for the target.
         """
-        self.pin_vtarget_en.value(self.vtarget_disable_value)
+        self.__set_vtarget_manually(self.vtarget_disable_value)
+
+    def set_triggered_vtarget(self, action:str = "none", timing:str = "before", offset_ns:int = 0):
+        """
+        Optionally toggle `VTARGET` automatically when the next glitch is emitted.
+
+        Parameters:
+            action: Either "enable", "disable" or "none" to disable this feature.
+            timing: Either "before" or "after". "before" applies the change when the glitch starts, "after" applies it when the glitch finished.
+            offset_ns: Optional timing correction in nanoseconds applied after the base schedule. Positive values delay VTARGET, negative values advance it.
+        """
+        if action == "on":
+            action = "enable"
+        elif action == "off":
+            action = "disable"
+        if action not in ["none", "enable", "disable"]:
+            raise Exception("Unsupported VTARGET action. Choose one of ['none', 'enable', 'disable'].")
+        if timing not in ["before", "after"]:
+            raise Exception("Unsupported VTARGET timing. Choose one of ['before', 'after'].")
+        self.load_switch_action = action
+        self.load_switch_timing = timing
+        self.load_switch_offset_ns = int(offset_ns)
+
+    def __arm_vtarget_toggle(self, delay_ns:int):
+        self.sm3.active(0)
+        while self.sm3.rx_fifo() != 0:
+            self.sm3.get()
+        self.load_switch_armed = False
+        self.load_switch_target_value = None
+        if self.load_switch_action == "none":
+            return
+
+        target_value = self.vtarget_enable_value
+        if self.load_switch_action == "disable":
+            target_value = self.vtarget_disable_value
+
+        current_value = self.pin_vtarget_en.value()
+        if current_value == target_value:
+            return
+
+        sm3_func = Statemachines.vtarget_toggle_from_low
+        if current_value == 1:
+            sm3_func = Statemachines.vtarget_toggle_from_high
+
+        self.sm3.init(sm3_func, freq=self.frequency, out_base=self.pin_vtarget_en)
+        self.sm3.put(max(0, int(delay_ns)) // (1_000_000_000 // self.frequency))
+        self.sm3.put(target_value)
+        self.load_switch_armed = True
+        self.load_switch_target_value = target_value
+        self.sm3.active(1)
+
+    def __schedule_vtarget_toggle(self, delay_ns:int, glitch_duration_ns:int = 0):
+        schedule_delay = delay_ns
+        if self.load_switch_timing == "after":
+            schedule_delay += glitch_duration_ns
+        schedule_delay += self.load_switch_offset_ns
+        self.__arm_vtarget_toggle(schedule_delay)
+
+    def __take_control_over_vtarget_pin(self, value:int|None = None):
+        if self.sm3 is not None:
+            current_value = self.pin_vtarget_en.value()
+            self.sm3.active(0)
+            self.sm3.irq(handler=None)
+            while self.sm3.rx_fifo() != 0:
+                self.sm3.get()
+        else:
+            current_value = self.pin_vtarget_en.value()
+        self.pin_vtarget_en = Pin(Globals.VTARGET_EN, Pin.OUT, self.vtarget_pull)
+        if value is None:
+            value = current_value
+        self.pin_vtarget_en.value(value)
+        self.load_switch_armed = False
+
+    def __set_vtarget_manually(self, value:int):
+        self.__take_control_over_vtarget_pin()
+        self.load_switch_target_value = None
+        self.pin_vtarget_en.value(value)
 
     def __ps_power_cycle(self, power_cycle_time:float):
         if self.sm0 is not None:
@@ -419,9 +509,14 @@ class PicoGlitcher():
         self.glitch_mode = "mul"
         self.pin_glitch = self.pin_mux1
 
-    def set_pulseshaping(self, vinit=1.8):
+    def set_pulseshaping(self, vinit=1.8, time_resolution_ns:int = 10, hold_cycles:int|None = None):
         """
         Enables the pulse-shaping mode of the Pico Glitcher version 2 to emit a pre-defined voltage pulse on the Pulse Shaping expansion board.
+
+        Parameters:
+            vinit: The initial voltage (voltage offset) used for internal DAC conversion.
+            time_resolution_ns: Preferred base time step of the generated waveform in nanoseconds.
+            hold_cycles: Optional AD9102 coarse timebase multiplier. If omitted, it is derived automatically from `time_resolution_ns` and may later be increased automatically so the waveform fits into SRAM.
         """
         if self.config["hardware_version"][0] < 2:
             raise Exception("Pulse-shaping not implemented in hardware version 1.")
@@ -429,11 +524,100 @@ class PicoGlitcher():
         self.pin_glitch = self.pin_ps_trigger
 
         # Configure the AD9102
+        self.ps_auto_timebase = hold_cycles is None
+        if hold_cycles is None:
+            hold_cycles = (int(time_resolution_ns) + AD910X.SRAM_SAMPLE_PERIOD_NS - 1) // AD910X.SRAM_SAMPLE_PERIOD_NS
+        self.ps_requested_hold_cycles = hold_cycles
+        self.__configure_pulseshaping_timebase(hold_cycles)
+        self.pulse_generator.set_offset(vinit)
+        self.ps_continuous_output_configured = False
+
+    def __configure_pulseshaping_timebase(self, hold_cycles:int):
+        if hold_cycles < 1 or hold_cycles > 16:
+            raise Exception("Pulse-shaping time base not supported. HOLD must be in range [1, 16].")
+        time_resolution_ns = AD910X.SRAM_SAMPLE_PERIOD_NS * hold_cycles
+        if self.ps_hold_cycles != hold_cycles or self.ps_time_resolution_ns != time_resolution_ns:
+            self.ps_hold_cycles = hold_cycles
+            self.ps_time_resolution_ns = time_resolution_ns
+            self.pulse_generator.set_time_resolution(self.ps_time_resolution_ns)
+        self.ad910x.set_gain(1.5)
+        # Keep the pattern-period LSB aligned with the held SRAM sample time so
+        # PAT_PERIOD=len(pulse) spans the entire waveform without trimming.
+        self.ad910x.set_pulse_output_oneshot(hold=self.ps_hold_cycles, pat_period_base=self.ps_hold_cycles)
+
+    def __prepare_pulseshaping_timebase(self, total_pulse_duration_ns:int):
+        if total_pulse_duration_ns < 0:
+            total_pulse_duration_ns = 0
+        max_points = self.pulse_generator.get_max_points()
+        max_duration_per_hold = max_points * AD910X.SRAM_SAMPLE_PERIOD_NS
+        minimum_hold_cycles = (int(total_pulse_duration_ns) + max_duration_per_hold - 1) // max_duration_per_hold
+        if minimum_hold_cycles < 1:
+            minimum_hold_cycles = 1
+
+        hold_cycles = self.ps_requested_hold_cycles
+        if self.ps_auto_timebase:
+            if hold_cycles < minimum_hold_cycles:
+                hold_cycles = minimum_hold_cycles
+        elif minimum_hold_cycles > hold_cycles:
+            raise Exception("Pulse too large for fixed pulse-shaping time base. Increase time_resolution_ns or omit hold_cycles to enable automatic scaling.")
+
+        if hold_cycles > 16:
+            raise Exception("Pulse too large for pulse-shaping SRAM. Increase the waveform time scale or shorten the pulse.")
+
+        self.__configure_pulseshaping_timebase(hold_cycles)
+
+    def set_voltage_source(self, vinit=1.8):
+        """
+        Enables the pulse-shaping mode of the Pico Glitcher version 2 to emit a constant voltage on the Pulse Shaping expansion board.
+        """
+        if self.config["hardware_version"][0] < 2:
+            raise Exception("Pulse-shaping not implemented in hardware version 1.")
+        if self.sm0 is not None:
+            self.sm0.active(0)
+            self.pin_ps_trigger = self.ad910x.init_trigger_pin()
+        self.glitch_mode = "pul"
+        self.pin_glitch = self.pin_ps_trigger
+        self.pin_ps_trigger.high()
+
         self.pulse_generator.set_offset(vinit)
         self.ad910x.set_frequency(self.pulse_generator.get_frequency())
         self.ad910x.set_gain(1.5)
-        # configure the AD9102 to emit an oneshot pulse
-        self.ad910x.set_pulse_output_oneshot()
+        self.ps_continuous_output_configured = False
+
+    def set_voltage(self, voltage:float):
+        """
+        Update the Pulse Shaping expansion board to continuously output a constant voltage.
+        """
+        pulse = self.pulse_generator.pulse_from_voltage(voltage)
+        if self.config["hardware_version"][0] < 2:
+            raise Exception("Pulse-shaping not implemented in hardware version 1.")
+        if self.sm0 is not None:
+            self.sm0.active(0)
+            self.pin_ps_trigger = self.ad910x.init_trigger_pin()
+            self.pin_glitch = self.pin_ps_trigger
+        self.ad910x.write_sram_from_start(pulse)
+
+        if not self.ps_continuous_output_configured:
+            self.pin_ps_trigger.high()
+            # Clear PRESTORE_SEL, CH_ADD, and WAVE_SEL so the DAC reads directly
+            # from SRAM for the continuous flat-voltage output.
+            reg_data = self.ad910x.spi_read_register(AD910X.REG_WAV_CONFIG)
+            reg_data &= 0xFFC8
+            self.ad910x.spi_write_register(AD910X.REG_PAT_TYPE, AD910X.PATTERN_RPT_CONTINOUS)
+            self.ad910x.spi_write_register(AD910X.REG_DAC_PAT, 0x0100)
+            self.ad910x.spi_write_register(AD910X.REG_WAV_CONFIG, reg_data)
+            self.ad910x.spi_write_register(AD910X.REG_PAT_TIMEBASE, 0x0111)
+            self.ad910x.spi_write_register(AD910X.REG_START_ADDR, 0x0000)
+            stop_addr = (((len(pulse) & 0x0FFF) - 1) << 4) & 0xFFF0
+            self.ad910x.spi_write_register(AD910X.REG_STOP_ADDR, stop_addr)
+            self.ad910x.spi_write_register(AD910X.REG_START_DLY, 0x0000)
+            self.ad910x.spi_write_register(AD910X.REG_PAT_PERIOD, len(pulse) & 0xFFFF)
+            self.ad910x.spi_write_register(AD910X.REG_RAM_UPDATE, AD910X.UPDATE_SETTINGS)
+            self.ad910x.spi_write_register(AD910X.REG_PAT_STATUS, AD910X.START_PATTERN)
+            self.pin_ps_trigger.low()
+            self.ps_continuous_output_configured = True
+        else:
+            self.ad910x.spi_write_register(AD910X.REG_RAM_UPDATE, AD910X.UPDATE_SETTINGS)
 
     def do_calibration(self, vhigh:float):
         """
@@ -452,8 +636,8 @@ class PicoGlitcher():
         Calculate and store the offset and gain parameters that were determined by the calibration routine. These values are stored in `config.json` and must be re-calculated if the config is overwritten.
 
         Parameters:
-            vhigh: The maximum voltage of the calibration voltage trace.
-            vlow: The minimum voltage of the calibration voltage trace.
+            vhigh: The measured steady high plateau of the calibration trace.
+            vlow: The measured steady low plateau of the calibration trace.
             store: wether to store the offset and gain factor in the Pico Glitcher configuration.
         """
         factor = 1/(vhigh - vlow)
@@ -501,6 +685,11 @@ class PicoGlitcher():
             self.sm2.irq(handler=None)
             while self.sm2.rx_fifo() != 0:
                 self.sm2.get()
+        if self.sm3 is not None:
+            self.sm3.active(0)
+            self.sm3.irq(handler=None)
+            while self.sm3.rx_fifo() != 0:
+                self.sm3.get()
         PIO(0).remove_program()
         PIO(1).remove_program()
 
@@ -561,7 +750,9 @@ class PicoGlitcher():
             number_of_pulses: The number of pulses to emit. This can be used to emit bursts of crowbar glitches.
             delay_between: The delay between each pulse.
         """
+        self.cleanup_pio()
         self.sm0.active(0)
+        delay_between_ns = int(delay_between)
         if number_of_pulses == 1:
             # state machine that emits the glitch if the trigger condition is met
             self.sm0.init(Statemachines.glitch, freq=self.frequency, set_base=self.pin_glitch, sideset_base=self.pin_glitch_en)
@@ -578,6 +769,9 @@ class PicoGlitcher():
             config = delay_between << 16 | pulse_length
             self.sm0.put(config)
             self.sm0.put(number_of_pulses - 1)
+
+        glitch_duration_ns = int(length) * int(number_of_pulses) + delay_between_ns * max(0, int(number_of_pulses) - 1)
+        self.__schedule_vtarget_toggle(delay, glitch_duration_ns)
 
         # call common arm function
         self.__arm_common()
@@ -599,6 +793,7 @@ class PicoGlitcher():
         # make delay2 relative to delay1 + length1
         delay2 = delay2 - (delay1 + length1)
 
+        self.cleanup_pio()
         self.sm0.active(0)
         # state machine that emits the glitch if the trigger condition is met
         self.sm0.init(Statemachines.glitch_multiple, freq=self.frequency, set_base=self.pin_glitch, sideset_base=self.pin_glitch_en)
@@ -619,6 +814,7 @@ class PicoGlitcher():
         self.sm0.put(config1)
         self.sm0.put(config2)
 
+        self.__schedule_vtarget_toggle(delay1, length1 + delay2 + length2)
         self.__arm_common()
 
     def arm_multiplexing(self, delay:int, mul_config:dict, vinit:str = "config"):
@@ -633,6 +829,7 @@ class PicoGlitcher():
         if self.config["hardware_version"][0] < 2:
             raise Exception("Multiplexing not implemented in hardware version 1.")
 
+        self.cleanup_pio()
         # state machine that emits the glitch if the trigger condition is met (part 1)
         self.sm0.active(0)
         if vinit == "config":
@@ -673,6 +870,13 @@ class PicoGlitcher():
         config = t4 << 18 | v4 << 16 | t3 << 2 | v3
         self.sm0.put(config)
 
+        glitch_duration_ns = 0
+        for key in ["t1", "t2", "t3", "t4"]:
+            try:
+                glitch_duration_ns += int(mul_config[key])
+            except Exception as _:
+                pass
+        self.__schedule_vtarget_toggle(delay, glitch_duration_ns)
         self.__arm_common()
 
     def arm_multiplexing_test(self, delay:int, mul_config:dict, vinit:str = "config"):
@@ -697,6 +901,7 @@ class PicoGlitcher():
         v4 = 0b10
         config = t4 << 18 | v4 << 16 | t3 << 2 | v3
         self.sm0.put(config)
+        self.__schedule_vtarget_toggle(delay, t1 + t2 + t3 + t4)
         self.__arm_common()
 
     def arm_pulseshaping_from_config(self, delay:int, ps_config:list[list[float]]):
@@ -707,6 +912,10 @@ class PicoGlitcher():
             delay: Glitch is emitted after this time. Given in nano seconds. Expect a resolution of about 5 nano seconds.
             ps_config: The pulse configuration given as a list of time deltas and voltage values.
         """
+        total_pulse_duration_ns = 0
+        for point in ps_config:
+            total_pulse_duration_ns += int(point[0])
+        self.__prepare_pulseshaping_timebase(total_pulse_duration_ns)
         pulse = self.pulse_generator.pulse_from_config(ps_config)
         self.__arm_pulseshaping(delay, pulse)
 
@@ -719,6 +928,10 @@ class PicoGlitcher():
             xpoints: A list of time points (in nanoseconds) where voltage changes occur.
             ypoints: The corresponding voltage levels at each time point.
         """
+        total_pulse_duration_ns = 0
+        if len(xpoints) > 0:
+            total_pulse_duration_ns = int(xpoints[-1]) - int(xpoints[0]) + self.ps_time_resolution_ns
+        self.__prepare_pulseshaping_timebase(total_pulse_duration_ns)
         pulse = self.pulse_generator.pulse_from_spline(xpoints, ypoints)
         self.__arm_pulseshaping(delay, pulse)
 
@@ -731,6 +944,7 @@ class PicoGlitcher():
             ps_lambda: A lambda function that defines the glitch at certain times. Must be given as string which is processed by the Pico Glitcher at runtime.
             pulse_number_of_points: The approximate length of the pulse. This is needed to constrain the pulse and to save computing time.
         """
+        self.__prepare_pulseshaping_timebase(pulse_number_of_points)
         pulse = self.pulse_generator.pulse_from_lambda(ps_lambda, pulse_number_of_points)
         self.__arm_pulseshaping(delay, pulse)
 
@@ -749,6 +963,7 @@ class PicoGlitcher():
         if self.config["hardware_version"][0] < 2:
             raise Exception("Multiplexing not implemented in hardware version 1.")
 
+        self.cleanup_pio()
         # load the pulse into AD9102 SRAM
         self.ad910x.write_sram_from_start(pulse)
         self.ad910x.update_sram(len(pulse))
@@ -758,9 +973,12 @@ class PicoGlitcher():
         self.sm0.init(Statemachines.pulse_shaping, freq=self.frequency, set_base=self.pin_glitch, out_base=self.pin_glitch, sideset_base=self.pin_glitch_en)
         # push delay (in nano seconds) into the fifo of the statemachine
         self.sm0.put(int(delay) // (1_000_000_000 // self.frequency))
-        maxlength = 10_000 # TODO: control this by an argument or the pulse length
+        effective_sample_ns = self.ps_time_resolution_ns
+        maxlength = len(pulse) * effective_sample_ns + effective_sample_ns
         self.sm0.put(maxlength // (1_000_000_000 // self.frequency))
 
+        glitch_duration_ns = len(pulse) * self.pulse_generator.time_resolution
+        self.__schedule_vtarget_toggle(delay, glitch_duration_ns)
         self.__arm_common()
         #print(pulse)
 
@@ -775,14 +993,21 @@ class PicoGlitcher():
             timeout_ms = int(timeout * 1_000)
             start_time = time.ticks_ms()
             while time.ticks_diff(time.ticks_ms(), start_time) < timeout_ms:
-                if self.sm0.rx_fifo() > 0:
+                glitch_finished = self.sm0.rx_fifo() > 0
+                load_switch_finished = (not self.load_switch_armed) or (self.sm3.rx_fifo() > 0)
+                if glitch_finished and load_switch_finished:
+                    if self.load_switch_armed:
+                        self.__take_control_over_vtarget_pin(self.load_switch_target_value)
+                    self.load_switch_target_value = None
                     self.armed = False
                     break
             if time.ticks_diff(time.ticks_ms(), start_time) >= timeout_ms:
                 self.sm0.active(0)
+                self.__take_control_over_vtarget_pin()
                 self.pin_glitch_en.low()
                 self.adc_samples_captured = True
                 self.armed = False
+                self.load_switch_target_value = None
                 raise Exception("Function execution timed out!")
 
     def check_glitch(self) -> bool:
@@ -882,6 +1107,12 @@ class PicoGlitcher():
         if time.ticks_diff(time.ticks_ms(), start_time) >= timeout_ms:
             raise Exception("ADC timed out!")
         print(self.fastsamples)
+
+    def measure_adc(self):
+        """
+        Capture ADC samples immediately when the command is executed.
+        """
+        print(self.fastadc.read())
 
     def configure_adc(self, number_of_samples:int = 1024, sampling_freq:int = 500_000):
         """

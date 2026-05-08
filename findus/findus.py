@@ -530,6 +530,9 @@ class PicoGlitcherInterface(MicroPythonScript):
     def enable_vtarget(self):
         self.pyb.exec('mp.enable_vtarget()')
 
+    def set_triggered_vtarget(self, action:str = "none", timing:str = "before", offset_ns:int = 0):
+        self.pyb.exec(f'mp.set_triggered_vtarget("{action}", "{timing}", {offset_ns})')
+
     def reset_target(self, reset_time:float):
         self.pyb.exec(f'mp.reset_target({reset_time})')
 
@@ -564,8 +567,14 @@ class PicoGlitcherInterface(MicroPythonScript):
     def set_multiplexing(self):
         self.pyb.exec('mp.set_multiplexing()')
 
-    def set_pulseshaping(self, vinit=1.8):
-        self.pyb.exec(f'mp.set_pulseshaping({vinit})')
+    def set_pulseshaping(self, vinit=1.8, time_resolution_ns:int = 10, hold_cycles:int|None = None):
+        self.pyb.exec(f'mp.set_pulseshaping({vinit}, {time_resolution_ns}, {hold_cycles})')
+
+    def set_voltage_source(self, vinit=1.8):
+        self.pyb.exec(f'mp.set_voltage_source({vinit})')
+
+    def set_voltage(self, voltage:float):
+        self.pyb.exec(f'mp.set_voltage({voltage})')
 
     def do_calibration(self, vhigh:float):
         self.pyb.exec(f'mp.do_calibration({vhigh})')
@@ -590,6 +599,9 @@ class PicoGlitcherInterface(MicroPythonScript):
 
     def get_adc_samples(self, timeout:float = 1.0) -> list[int]:
         return self.pyb.exec(f'mp.get_adc_samples({timeout})')
+
+    def measure_adc(self) -> list[int]:
+        return self.pyb.exec('mp.measure_adc()')
 
     def configure_adc(self, number_of_samples:int = 1024, sampling_freq:int = 500_000):
         self.pyb.exec(f'mp.configure_adc({number_of_samples}, {sampling_freq})')
@@ -1015,6 +1027,17 @@ class PicoGlitcher(Glitcher):
         """
         self.pico_glitcher.disable_vtarget()
 
+    def set_triggered_vtarget(self, action:str = "none", timing:str = "before", offset_ns:int = 0):
+        """
+        Optionally toggle the Pico Glitcher's `VTARGET` output when the glitch is emitted.
+
+        Parameters:
+            action: Either `'enable'`, `'disable'` or `'none'`.
+            timing: Apply the change `'before'` the glitch starts or `'after'` it finished.
+            offset_ns: Optional timing correction in nanoseconds. Positive values delay VTARGET, negative values advance it.
+        """
+        self.pico_glitcher.set_triggered_vtarget(action, timing, offset_ns)
+
     def set_mux_voltage(self, voltage:str):
         """
         TODO
@@ -1121,14 +1144,34 @@ class PicoGlitcher(Glitcher):
         """
         self.pico_glitcher.set_multiplexing()
 
-    def set_pulseshaping(self, vinit:float = 1.8):
+    def set_pulseshaping(self, vinit:float = 1.8, time_resolution_ns:int = 10, hold_cycles:int|None = None):
         """
         Enables the pulse-shaping mode of the Pico Glitcher version 2 to apply a voltage profile to the target's supply voltage.
 
         Parameters:
             vinit: The initial voltage (voltage offset) to base the calculations on. This does not change the output voltage of the pulse shaping expansion board. However, this parameter is used to calculate the correct offsets and scaling of the pulse.
+            time_resolution_ns: Preferred base time step of the generated pulse in nanoseconds. The actual AD9102 SRAM step is quantized to multiples of `8ns` at the current `125MHz` DAC clock, and firmware may automatically increase it when needed so the waveform fits into SRAM.
+            hold_cycles: Optional AD9102 coarse timebase multiplier. If omitted, it is derived automatically from `time_resolution_ns` and may still be increased by firmware for long waveforms. If explicitly provided, that fixed time base is enforced.
         """
-        self.pico_glitcher.set_pulseshaping(vinit)
+        self.pico_glitcher.set_pulseshaping(vinit, time_resolution_ns, hold_cycles)
+
+    def set_voltage_source(self, vinit:float=1.8):
+        """
+        Enables the pulse-shaping mode of the Pico Glitcher version 2 for continuous voltage output.
+
+        Parameters:
+            vinit: The initial voltage (voltage offset) used for the internal DAC conversion.
+        """
+        self.pico_glitcher.set_voltage_source(vinit)
+
+    def set_voltage(self, voltage:float):
+        """
+        Update the pulse shaping output to a constant voltage level.
+
+        Parameters:
+            voltage: The desired constant output voltage.
+        """
+        self.pico_glitcher.set_voltage(voltage)
 
     def do_calibration(self, vhigh:float):
         """
@@ -1278,12 +1321,13 @@ class PicoGlitcher(Glitcher):
         """
         Read back the captured ADC samples.
         """
-        samples = self.pico_glitcher.get_adc_samples(timeout)
-        #print(samples)
-        decoded_str = samples.decode().strip()
-        num_str = decoded_str.split("[")[1].split("]")[0]
-        int_list = [int(x) for x in num_str.split(",")]
-        return int_list
+        return self.__decode_adc_samples(self.pico_glitcher.get_adc_samples(timeout))
+
+    def measure_adc_samples(self) -> list[int]:
+        """
+        Capture ADC samples immediately when the command is executed.
+        """
+        return self.__decode_adc_samples(self.pico_glitcher.measure_adc())
 
     def configure_adc(self, number_of_samples:int = 1024, sampling_freq:int = 500_000):
         """
@@ -1294,6 +1338,11 @@ class PicoGlitcher(Glitcher):
             sampling_freq: The sampling frequency of the ADC. `500 kSPS` is the maximum for the Pico Glitcher.
         """
         self.pico_glitcher.configure_adc(number_of_samples, sampling_freq)
+
+    def __decode_adc_samples(self, samples:bytes) -> list[int]:
+        decoded_str = samples.decode().strip()
+        num_str = decoded_str.split("[")[1].split("]")[0]
+        return [int(x) for x in num_str.split(",")]
 
     def hard_reset(self):
         """
